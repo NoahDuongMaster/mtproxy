@@ -485,9 +485,11 @@ myrandom = MyRandom()
 
 class TgConnectionPool:
     MAX_CONNS_IN_POOL = 64
+    MIN_CONNS_IN_POOL = 1  # Keep at least one connection ready
 
     def __init__(self):
         self.pools = {}
+        self.connection_locks = {}  # Add locks to prevent race conditions
 
     async def open_tg_connection(self, host, port, init_func=None):
         task = asyncio.open_connection(host, port, limit=get_to_clt_bufsize())
@@ -502,36 +504,44 @@ class TgConnectionPool:
         return reader_tgt, writer_tgt
 
     def register_host_port(self, host, port, init_func):
-        if (host, port, init_func) not in self.pools:
-            self.pools[(host, port, init_func)] = []
+        key = (host, port, init_func)
+        if key not in self.pools:
+            self.pools[key] = []
+            self.connection_locks[key] = asyncio.Lock()
 
-        while len(self.pools[(host, port, init_func)]) < TgConnectionPool.MAX_CONNS_IN_POOL:
+        # Only create new connections if we're below MIN_CONNS_IN_POOL
+        if len(self.pools[key]) < self.MIN_CONNS_IN_POOL:
             connect_task = asyncio.ensure_future(self.open_tg_connection(host, port, init_func))
-            self.pools[(host, port, init_func)].append(connect_task)
+            self.pools[key].append(connect_task)
 
     async def get_connection(self, host, port, init_func=None):
+        key = (host, port, init_func)
         self.register_host_port(host, port, init_func)
 
-        ret = None
-        for task in self.pools[(host, port, init_func)][::]:
-            if task.done():
-                if task.exception():
-                    self.pools[(host, port, init_func)].remove(task)
-                    continue
+        async with self.connection_locks[key]:
+            ret = None
+            for task in self.pools[key][::]:
+                if task.done():
+                    if task.exception():
+                        self.pools[key].remove(task)
+                        continue
 
-                reader, writer, *other = task.result()
-                if writer.transport.is_closing():
-                    self.pools[(host, port, init_func)].remove(task)
-                    continue
+                    reader, writer, *other = task.result()
+                    if writer.transport.is_closing():
+                        self.pools[key].remove(task)
+                        continue
 
-                if not ret:
-                    self.pools[(host, port, init_func)].remove(task)
-                    ret = (reader, writer, *other)
+                    if not ret:
+                        self.pools[key].remove(task)
+                        ret = (reader, writer, *other)
 
-        self.register_host_port(host, port, init_func)
-        if ret:
+            # Only create a new connection if we have none available
+            if not ret:
+                ret = await self.open_tg_connection(host, port, init_func)
+            
+            # Ensure we maintain minimum connections
+            self.register_host_port(host, port, init_func)
             return ret
-        return await self.open_tg_connection(host, port, init_func)
 
 
 tg_connection_pool = TgConnectionPool()
