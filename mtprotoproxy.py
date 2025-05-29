@@ -1984,7 +1984,7 @@ async def get_encrypted_cert(host, port, server_name):
 async def get_mask_host_cert_len():
     global fake_cert_len
 
-    GET_CERT_TIMEOUT = 10
+    GET_CERT_TIMEOUT = 20  # Increased from 10 to 20 seconds to handle network latency
     MASK_ENABLING_CHECK_PERIOD = 60
 
     while True:
@@ -2009,13 +2009,13 @@ async def get_mask_host_cert_len():
                 print_err("The MASK_HOST %s is not TLS 1.3 host, this is not recommended" %
                           config.MASK_HOST)
         except ConnectionRefusedError:
-            print_err("The MASK_HOST %s is refusing connections, this is not recommended" %
+            print_err("The MASK_HOST %s is refusing connections, this is not recommended. Check network or host availability." %
                       config.MASK_HOST)
         except (TimeoutError, asyncio.TimeoutError):
-            print_err("Got timeout while getting TLS handshake from MASK_HOST %s" %
+            print_err("Got timeout while getting TLS handshake from MASK_HOST %s. Check network connectivity or increase timeout." %
                       config.MASK_HOST)
         except Exception as E:
-            print_err("Failed to connect to MASK_HOST %s: %s" % (
+            print_err("Failed to connect to MASK_HOST %s: %s. Ensure MASK_HOST is correct and accessible." % (
                       config.MASK_HOST, E))
 
         await asyncio.sleep(config.GET_CERT_LEN_PERIOD)
