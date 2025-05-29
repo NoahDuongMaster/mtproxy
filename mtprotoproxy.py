@@ -1150,6 +1150,7 @@ async def handle_fake_tls_handshake(handshake, reader, writer, peer):
 
     if digest[:DIGEST_HALFLEN] in used_handshakes:
         last_clients_with_same_handshake[peer[0]] += 1
+        print_err(f"Rejected connection from {peer[0]}:{peer[1]} due to duplicate handshake (possible replay attack)")
         return False
 
     sess_id_len = handshake[SESSION_ID_LEN_POS]
@@ -1165,6 +1166,7 @@ async def handle_fake_tls_handshake(handshake, reader, writer, peer):
         digest_good = xored_digest.startswith(b"\x00" * (DIGEST_LEN-4))
 
         if not digest_good:
+            print_err(f"Rejected connection from {peer[0]}:{peer[1]} for user {user} due to invalid digest")
             continue
 
         timestamp = int.from_bytes(xored_digest[-4:], "little")
@@ -1175,7 +1177,9 @@ async def handle_fake_tls_handshake(handshake, reader, writer, peer):
         accept_bad_time = config.IGNORE_TIME_SKEW or is_time_skewed or client_time_is_small
 
         if not client_time_is_ok and not accept_bad_time:
-            last_clients_with_time_skew[peer[0]] = (time.time() - timestamp) // 60
+            skew_minutes = (time.time() - timestamp) // 60
+            last_clients_with_time_skew[peer[0]] = skew_minutes
+            print_err(f"Rejected connection from {peer[0]}:{peer[1]} for user {user} due to time skew: {skew_minutes} minutes")
             continue
 
         http_data = myrandom.getrandbytes(fake_cert_len)
@@ -1210,6 +1214,7 @@ async def handle_fake_tls_handshake(handshake, reader, writer, peer):
         writer = FakeTLSStreamWriter(writer)
         return reader, writer
 
+    print_err(f"Rejected connection from {peer[0]}:{peer[1]} due to no matching user secret")
     return False
 
 
@@ -1277,11 +1282,13 @@ async def handle_handshake(reader, writer):
     TLS_START_BYTES = b"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03"
 
     if writer.transport.is_closing() or writer.get_extra_info("peername") is None:
+        print_err(f"Rejected connection due to closed transport or missing peer info")
         return False
 
     peer = writer.get_extra_info("peername")[:2]
     if not peer:
         peer = ("unknown ip", 0)
+        print_err(f"Connection rejected: peer info unavailable")
 
     if config.PROXY_PROTOCOL:
         ip = peer[0] if peer else "unknown ip"
@@ -1304,12 +1311,14 @@ async def handle_handshake(reader, writer):
         tls_handshake_result = await handle_fake_tls_handshake(handshake, reader, writer, peer)
 
         if not tls_handshake_result:
+            print_err(f"TLS handshake failed for client {peer[0]}:{peer[1]}")
             await handle_bad_client(reader, writer, handshake)
             return False
         reader, writer = tls_handshake_result
         handshake = await reader.readexactly(HANDSHAKE_LEN)
     else:
         if not config.MODES["classic"] and not config.MODES["secure"]:
+            print_err(f"Non-TLS handshake rejected for client {peer[0]}:{peer[1]} due to mode restrictions")
             await handle_bad_client(reader, writer, handshake)
             return False
         handshake += await reader.readexactly(HANDSHAKE_LEN - len(handshake))
@@ -1321,6 +1330,7 @@ async def handle_handshake(reader, writer):
 
     if dec_prekey_and_iv in used_handshakes:
         last_clients_with_same_handshake[peer[0]] += 1
+        print_err(f"Rejected connection from {peer[0]}:{peer[1]} due to duplicate handshake (possible replay attack)")
         await handle_bad_client(reader, writer, handshake)
         return False
 
@@ -1337,15 +1347,19 @@ async def handle_handshake(reader, writer):
 
         proto_tag = decrypted[PROTO_TAG_POS:PROTO_TAG_POS+4]
         if proto_tag not in (PROTO_TAG_ABRIDGED, PROTO_TAG_INTERMEDIATE, PROTO_TAG_SECURE):
+            print_err(f"Rejected connection from {peer[0]}:{peer[1]} for user {user} due to invalid proto tag")
             continue
 
         if proto_tag == PROTO_TAG_SECURE:
             if is_tls_handshake and not config.MODES["tls"]:
+                print_err(f"Rejected connection from {peer[0]}:{peer[1]} for user {user} due to TLS mode disabled")
                 continue
             if not is_tls_handshake and not config.MODES["secure"]:
+                print_err(f"Rejected connection from {peer[0]}:{peer[1]} for user {user} due to secure mode disabled")
                 continue
         else:
             if not config.MODES["classic"]:
+                print_err(f"Rejected connection from {peer[0]}:{peer[1]} for user {user} due to classic mode disabled")
                 continue
 
         dc_idx = int.from_bytes(decrypted[DC_IDX_POS:DC_IDX_POS+2], "little", signed=True)
@@ -1366,6 +1380,7 @@ async def handle_handshake(reader, writer):
         writer = CryptoWrappedStreamWriter(writer, encryptor)
         return reader, writer, proto_tag, user, dc_idx, enc_key + enc_iv, peer
 
+    print_err(f"Rejected connection from {peer[0]}:{peer[1]} due to no matching user secret in non-TLS handshake")
     await handle_bad_client(reader, writer, handshake)
     return False
 
