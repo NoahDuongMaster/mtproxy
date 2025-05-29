@@ -486,10 +486,37 @@ myrandom = MyRandom()
 class TgConnectionPool:
     MAX_CONNS_IN_POOL = 64
     MIN_CONNS_IN_POOL = 1  # Keep at least one connection ready
+    REFRESH_INTERVAL = 300  # Refresh connections every 5 minutes
 
     def __init__(self):
         self.pools = {}
         self.connection_locks = {}  # Add locks to prevent race conditions
+        self.last_refresh = {}
+
+    async def refresh_connections(self, host, port, init_func=None):
+        key = (host, port, init_func)
+        if key not in self.pools:
+            return
+        async with self.connection_locks.get(key, asyncio.Lock()):
+            current_time = time.time()
+            if key in self.last_refresh and current_time - self.last_refresh[key] < self.REFRESH_INTERVAL:
+                return
+            self.last_refresh[key] = current_time
+            # Remove closed or failed connections
+            for task in self.pools[key][::]:
+                if task.done() and (task.exception() or task.result()[1].transport.is_closing()):
+                    self.pools[key].remove(task)
+            # Ensure minimum connections
+            while len(self.pools[key]) < self.MIN_CONNS_IN_POOL:
+                connect_task = asyncio.ensure_future(self.open_tg_connection(host, port, init_func))
+                self.pools[key].append(connect_task)
+
+    async def refresh_all_pools(self):
+        while True:
+            for key in list(self.pools.keys()):
+                host, port, init_func = key
+                await self.refresh_connections(host, port, init_func)
+            await asyncio.sleep(self.REFRESH_INTERVAL)
 
     async def open_tg_connection(self, host, port, init_func=None):
         task = asyncio.open_connection(host, port, limit=get_to_clt_bufsize())
@@ -517,6 +544,7 @@ class TgConnectionPool:
     async def get_connection(self, host, port, init_func=None):
         key = (host, port, init_func)
         self.register_host_port(host, port, init_func)
+        await self.refresh_connections(host, port, init_func)
 
         async with self.connection_locks[key]:
             ret = None
@@ -2321,6 +2349,10 @@ def create_utilitary_tasks(loop):
     clear_resolving_cache_task = asyncio.Task(clear_ip_resolving_cache(), loop=loop)
     tasks.append(clear_resolving_cache_task)
 
+    # Add task to refresh all connection pools periodically
+    refresh_pools_task = asyncio.Task(tg_connection_pool.refresh_all_pools(), loop=loop)
+    tasks.append(refresh_pools_task)
+
     return tasks
 
 
@@ -2352,10 +2384,36 @@ def main():
 
     servers = create_servers(loop)
 
-    try:
-        loop.run_forever()
-    except KeyboardInterrupt:
-        pass
+    max_retries = 3
+    retry_count = 0
+    while retry_count < max_retries:
+        try:
+            loop.run_forever()
+            break
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            retry_count += 1
+            print_err(f"Unexpected error in main loop (attempt {retry_count}/{max_retries}): {e}")
+            traceback.print_exc()
+            if retry_count < max_retries:
+                print_err("Restarting main loop...")
+                # Cancel existing tasks
+                if hasattr(asyncio, "all_tasks"):
+                    tasks = asyncio.all_tasks(loop)
+                else:
+                    tasks = asyncio.Task.all_tasks(loop)
+                for task in tasks:
+                    task.cancel()
+                # Restart servers and tasks
+                utilitary_tasks = create_utilitary_tasks(loop)
+                for task in utilitary_tasks:
+                    asyncio.ensure_future(task)
+                servers = create_servers(loop)
+                time.sleep(5)  # Wait before retrying
+            else:
+                print_err("Max retries reached. Exiting.")
+                break
 
     if hasattr(asyncio, "all_tasks"):
         tasks = asyncio.all_tasks(loop)
